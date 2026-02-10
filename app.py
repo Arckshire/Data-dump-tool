@@ -30,7 +30,6 @@ def is_valid_identifier(name: str) -> bool:
 def quote_ident(ident: str) -> str:
     if not ident:
         raise ValueError("Empty identifier")
-    # Quote if not a simple identifier (keeps things safer with odd names)
     return f'"{ident}"' if not is_valid_identifier(ident) else ident
 
 def build_where_clause(filters_payload):
@@ -69,7 +68,6 @@ def build_where_clause(filters_payload):
                 if val is None or str(val).strip() == "":
                     errors.append(f"Numeric value missing for {col}")
                     continue
-                # Keep numeric as-is; user must input numeric.
                 clauses.append(f"{col_sql} {op} {val}")
             elif op == "between":
                 start = f.get("start")
@@ -127,20 +125,13 @@ def build_where_clause(filters_payload):
     return "WHERE " + "\n  AND ".join(clauses), []
 
 def standardize_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Accepts many common Snowflake export header styles and normalizes to:
-    db_name, schema_name, table_name, ordinal_position, column_name, data_type, is_nullable (optional)
-    """
-    # Lowercase headers for matching
     original_cols = list(df.columns)
-    cols = {c: c.strip().lower() for c in df.columns}
-    df = df.rename(columns=cols)
+    df = df.rename(columns={c: c.strip().lower() for c in df.columns})
 
-    # Possible mappings from Snowflake exports
     candidates = {
-        "db_name": ["db_name", "table_catalog", "table_catalog_name", "catalog", "database", "database_name"],
-        "schema_name": ["schema_name", "table_schema", "schema", "schema_name_"],
-        "table_name": ["table_name", "table", "table_name_"],
+        "db_name": ["db_name", "table_catalog", "catalog", "database", "database_name"],
+        "schema_name": ["schema_name", "table_schema", "schema"],
+        "table_name": ["table_name", "table"],
         "ordinal_position": ["ordinal_position", "position", "column_id", "column_ordinal_position"],
         "column_name": ["column_name", "column", "name"],
         "data_type": ["data_type", "type"],
@@ -158,22 +149,18 @@ def standardize_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
     missing = [r for r in required if r not in resolved]
     if missing:
         raise ValueError(
-            "CSV headers not recognized. I expected columns like "
+            "CSV headers not recognized. Expected columns like "
             "db_name/table_catalog, schema_name/table_schema, table_name, "
             "ordinal_position, column_name, data_type.\n\n"
             f"Found headers: {original_cols}"
         )
 
-    # Rename into standard names
     rename_map = {resolved[k]: k for k in resolved}
     df = df.rename(columns=rename_map)
 
-    # Coerce types
     df["ordinal_position"] = pd.to_numeric(df["ordinal_position"], errors="coerce")
     for c in ["db_name", "schema_name", "table_name", "column_name", "data_type"]:
         df[c] = df[c].astype(str)
-
-    # Optional nullable
     if "is_nullable" in df.columns:
         df["is_nullable"] = df["is_nullable"].astype(str)
 
@@ -181,12 +168,12 @@ def standardize_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- UI ----------------
 st.title("Snowflake Self-Serve Query Builder (Dev)")
-st.caption("Dev mode: Upload exported metadata CSV. App generates SQL for copy/paste into Snowflake. No metadata is stored in GitHub.")
+st.caption("Dev mode: Upload exported metadata CSV. App generates SQL for copy/paste into Snowflake.")
 
 with st.sidebar:
     st.header("Metadata")
-    uploaded = st.file_uploader("Upload metadata CSV (Snowflake columns export)", type=["csv"])
-    st.caption("Tip: This keeps your repo public without publishing table/column structure.")
+    uploaded = st.file_uploader("Upload metadata CSV", type=["csv"])
+    st.caption("This avoids committing company table structure to a public repo.")
 
 if not uploaded:
     st.info("Upload your metadata CSV to begin.")
@@ -204,31 +191,49 @@ tables = sorted(meta["full_table"].unique().tolist())
 
 left, right = st.columns([0.35, 0.65], gap="large")
 
+# ---------- Table selection as a full list ----------
 with left:
     st.subheader("1) Select table")
-    search = st.text_input("Search table", placeholder="Type to filter…")
-    filtered_tables = [t for t in tables if search.lower() in t.lower()] if search else tables
-    selected_table = st.selectbox("Table", filtered_tables, index=0 if filtered_tables else None)
 
-    row_limit = st.number_input("Row limit (safety)", min_value=1, max_value=5_000_000, value=DEFAULT_ROW_LIMIT, step=10000)
+    # For 15 tables, radio is nicer than dropdown
+    selected_table = st.radio("Tables", options=tables, index=0)
 
-    if not selected_table:
-        st.info("Select a table to continue.")
-        st.stop()
+    st.markdown("---")
+    disable_limit = st.checkbox("Disable row LIMIT (get all matching rows)", value=False)
+
+    row_limit = None
+    if not disable_limit:
+        row_limit = st.number_input(
+            "Row limit (safety)",
+            min_value=1, max_value=5_000_000,
+            value=DEFAULT_ROW_LIMIT,
+            step=10000
+        )
+    else:
+        st.warning("LIMIT is disabled. A date range filter will be required.")
 
     st.markdown(f"**Selected:** `{selected_table}`")
 
-tcols = meta[meta["full_table"] == selected_table].sort_values("ordinal_position")
+tcols = meta[meta["full_table"] == selected_table].sort_values("ordinal_position").copy()
 tcols["data_family"] = tcols["data_type"].apply(normalize_dtype)
+
+# Identify datetime columns
+datetime_cols = tcols.loc[tcols["data_family"] == "datetime", "column_name"].tolist()
+default_date_col = datetime_cols[0] if datetime_cols else None
 
 with right:
     st.subheader("2) Pick columns + filters")
 
     with st.expander("Columns in selected table", expanded=True):
-        show_cols = ["ordinal_position", "column_name", "data_type", "data_family"]
-        st.dataframe(tcols[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(
+            tcols[["ordinal_position", "column_name", "data_type", "data_family"]],
+            use_container_width=True,
+            hide_index=True
+        )
 
     st.markdown("---")
+
+    # Output column selection
     st.markdown("### Output columns")
     all_col_names = tcols["column_name"].tolist()
     default_selected = all_col_names[: min(15, len(all_col_names))]
@@ -240,13 +245,59 @@ with right:
     )
 
     st.markdown("### Filters")
+
+    # ---- Mandatory date filter logic when LIMIT disabled ----
+    if disable_limit:
+        if not default_date_col:
+            st.error("LIMIT is disabled, but this table has no DATE/TIMESTAMP columns. Re-enable LIMIT or choose a different table.")
+            st.stop()
+
+        st.info(
+            f"Because LIMIT is disabled, a date range filter is required.\n\n"
+            f"Default date column selected: **{default_date_col}**. You can change it below."
+        )
+
+        chosen_date_col = st.selectbox(
+            "Required date column",
+            options=datetime_cols,
+            index=0,
+            key="required_date_col"
+        )
+
+        if chosen_date_col == default_date_col:
+            st.caption("Using the default first date-type column. Change it if you want a different date field.")
+
+        # Build mandatory date filter payload (always present)
+        st.write(f"**Required date filter** · `{chosen_date_col}`")
+        dt_mode = st.selectbox("Date filter type", ["between", "before", "after", "on"], key="req_dt_mode")
+
+        required_date_payload = {"column_name": chosen_date_col, "data_family": "datetime", "mode": dt_mode}
+        if dt_mode == "between":
+            start = st.date_input("Start date", key="req_dt_start")
+            end = st.date_input("End date", key="req_dt_end")
+            required_date_payload["start"] = start.isoformat() if isinstance(start, date) else None
+            required_date_payload["end"] = end.isoformat() if isinstance(end, date) else None
+        else:
+            d = st.date_input("Date", key="req_dt_single")
+            required_date_payload["value"] = d.isoformat() if isinstance(d, date) else None
+
+        st.markdown("---")
+
+    # Optional filters chosen by user (cannot remove the required date filter if disable_limit=True)
     filter_cols = st.multiselect(
-        "Choose columns to filter on (each chosen filter must have a value)",
+        "Choose additional columns to filter on (each chosen filter must have a value)",
         options=all_col_names,
-        default=[]
+        default=[],
+        key="optional_filter_cols"
     )
 
     filters_payload = []
+
+    # Add required date filter first (if applicable)
+    if disable_limit:
+        filters_payload.append(required_date_payload)
+
+    # Render optional filters
     if filter_cols:
         st.caption("Fill every filter below. Remove a filter column if you don’t want to provide a value.")
         for col in filter_cols:
@@ -314,10 +365,11 @@ with right:
         if out_cols:
             select_sql = ", ".join([quote_ident(c) for c in out_cols])
 
+        limit_sql = "" if disable_limit else f"\nLIMIT {int(row_limit)}"
+
         sql = f"""SELECT {select_sql}
 FROM {selected_table}
-{where_sql}
-LIMIT {int(row_limit)};
+{where_sql}{limit_sql};
 """
         st.success("SQL generated. Copy/paste into Snowflake.")
         st.code(sql, language="sql")
