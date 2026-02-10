@@ -1,26 +1,22 @@
 import re
 import pandas as pd
 import streamlit as st
-from datetime import date, datetime
+from datetime import date
 
 st.set_page_config(page_title="Snowflake Self-Serve Query Builder (Dev)", layout="wide")
 
-# ---------- Config ----------
-METADATA_CSV_PATH = "data/table_columns_catalog.csv"
 DEFAULT_ROW_LIMIT = 100000
 
-# ---------- Helpers ----------
+# ---------------- Helpers ----------------
 def normalize_dtype(dtype: str) -> str:
-    """Map Snowflake data types into broad UI categories."""
     if not dtype:
         return "other"
-    d = dtype.upper()
-
+    d = str(dtype).upper()
     if "TIMESTAMP" in d or d in {"DATE", "DATETIME", "TIME"}:
         return "datetime"
     if any(x in d for x in ["NUMBER", "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL"]):
         return "number"
-    if d in {"BOOLEAN"}:
+    if d == "BOOLEAN":
         return "boolean"
     if any(x in d for x in ["CHAR", "STRING", "TEXT", "VARCHAR"]):
         return "text"
@@ -29,38 +25,21 @@ def normalize_dtype(dtype: str) -> str:
     return "other"
 
 def is_valid_identifier(name: str) -> bool:
-    # Simple safety check; Snowflake identifiers can be quoted, but we’ll keep it strict for v1.
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or ""))
 
 def quote_ident(ident: str) -> str:
-    """
-    Safely quote column identifiers. We still validate to avoid injecting weird identifiers.
-    If your metadata includes mixed-case or special chars, this quoting helps.
-    """
     if not ident:
         raise ValueError("Empty identifier")
-    # allow typical snowflake identifiers; if something odd appears, still quote it.
+    # Quote if not a simple identifier (keeps things safer with odd names)
     return f'"{ident}"' if not is_valid_identifier(ident) else ident
 
-def fq_table(db: str, schema: str, table: str) -> str:
-    return f"{db}.{schema}.{table}"
-
 def build_where_clause(filters_payload):
-    """
-    filters_payload: list of dicts with keys:
-      - column_name
-      - data_family: datetime/number/text/boolean/other
-      - operator
-      - value (or start/end for range)
-    Returns: (where_sql, errors)
-    """
     clauses = []
     errors = []
 
     for f in filters_payload:
         col = f["column_name"]
         family = f["data_family"]
-        op = f.get("operator")
         col_sql = quote_ident(col)
 
         if family == "datetime":
@@ -72,34 +51,25 @@ def build_where_clause(filters_payload):
                     errors.append(f"Date range missing for {col}")
                     continue
                 clauses.append(f"{col_sql} BETWEEN '{start}' AND '{end}'")
-            elif mode == "before":
+            elif mode in {"before", "after", "on"}:
                 val = f.get("value")
                 if not val:
                     errors.append(f"Date value missing for {col}")
                     continue
-                clauses.append(f"{col_sql} < '{val}'")
-            elif mode == "after":
-                val = f.get("value")
-                if not val:
-                    errors.append(f"Date value missing for {col}")
-                    continue
-                clauses.append(f"{col_sql} > '{val}'")
-            elif mode == "on":
-                val = f.get("value")
-                if not val:
-                    errors.append(f"Date value missing for {col}")
-                    continue
-                clauses.append(f"{col_sql} = '{val}'")
+                op = {"before": "<", "after": ">", "on": "="}[mode]
+                clauses.append(f"{col_sql} {op} '{val}'")
             else:
                 errors.append(f"Unknown datetime filter mode for {col}")
                 continue
 
         elif family == "number":
+            op = f.get("operator")
             if op in {"=", "!=", "<", "<=", ">", ">="}:
                 val = f.get("value")
-                if val is None or val == "":
+                if val is None or str(val).strip() == "":
                     errors.append(f"Numeric value missing for {col}")
                     continue
+                # Keep numeric as-is; user must input numeric.
                 clauses.append(f"{col_sql} {op} {val}")
             elif op == "between":
                 start = f.get("start")
@@ -120,7 +90,7 @@ def build_where_clause(filters_payload):
             clauses.append(f"{col_sql} = {str(val).upper()}")
 
         else:
-            # Treat as text by default
+            op = f.get("operator")
             if op == "equals":
                 val = f.get("value")
                 if not val:
@@ -152,63 +122,102 @@ def build_where_clause(filters_payload):
 
     if errors:
         return "", errors
-
     if not clauses:
         return "", []
-
     return "WHERE " + "\n  AND ".join(clauses), []
 
-# ---------- Load metadata ----------
-@st.cache_data(show_spinner=False)
-def load_metadata(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # expected columns: db_name, schema_name, table_name, ordinal_position, column_name, data_type, is_nullable
-    required = {"db_name", "schema_name", "table_name", "ordinal_position", "column_name", "data_type"}
-    missing = required - set(df.columns.str.lower())
-    # Some exports preserve case; normalize.
-    df.columns = [c.lower() for c in df.columns]
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Metadata CSV missing columns: {missing}")
+def standardize_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Accepts many common Snowflake export header styles and normalizes to:
+    db_name, schema_name, table_name, ordinal_position, column_name, data_type, is_nullable (optional)
+    """
+    # Lowercase headers for matching
+    original_cols = list(df.columns)
+    cols = {c: c.strip().lower() for c in df.columns}
+    df = df.rename(columns=cols)
 
-    # Coerce
+    # Possible mappings from Snowflake exports
+    candidates = {
+        "db_name": ["db_name", "table_catalog", "table_catalog_name", "catalog", "database", "database_name"],
+        "schema_name": ["schema_name", "table_schema", "schema", "schema_name_"],
+        "table_name": ["table_name", "table", "table_name_"],
+        "ordinal_position": ["ordinal_position", "position", "column_id", "column_ordinal_position"],
+        "column_name": ["column_name", "column", "name"],
+        "data_type": ["data_type", "type"],
+        "is_nullable": ["is_nullable", "nullable"],
+    }
+
+    resolved = {}
+    for target, options in candidates.items():
+        for opt in options:
+            if opt in df.columns:
+                resolved[target] = opt
+                break
+
+    required = ["db_name", "schema_name", "table_name", "ordinal_position", "column_name", "data_type"]
+    missing = [r for r in required if r not in resolved]
+    if missing:
+        raise ValueError(
+            "CSV headers not recognized. I expected columns like "
+            "db_name/table_catalog, schema_name/table_schema, table_name, "
+            "ordinal_position, column_name, data_type.\n\n"
+            f"Found headers: {original_cols}"
+        )
+
+    # Rename into standard names
+    rename_map = {resolved[k]: k for k in resolved}
+    df = df.rename(columns=rename_map)
+
+    # Coerce types
     df["ordinal_position"] = pd.to_numeric(df["ordinal_position"], errors="coerce")
-    df["data_type"] = df["data_type"].astype(str)
-    df["column_name"] = df["column_name"].astype(str)
+    for c in ["db_name", "schema_name", "table_name", "column_name", "data_type"]:
+        df[c] = df[c].astype(str)
+
+    # Optional nullable
+    if "is_nullable" in df.columns:
+        df["is_nullable"] = df["is_nullable"].astype(str)
+
     return df
 
+# ---------------- UI ----------------
 st.title("Snowflake Self-Serve Query Builder (Dev)")
-st.caption("Dev mode: Uses exported metadata CSV and generates SQL for copy/paste into Snowflake.")
+st.caption("Dev mode: Upload exported metadata CSV. App generates SQL for copy/paste into Snowflake. No metadata is stored in GitHub.")
 
-try:
-    meta = load_metadata(METADATA_CSV_PATH)
-except Exception as e:
-    st.error(f"Could not load metadata CSV at '{METADATA_CSV_PATH}'.\n\nError: {e}")
+with st.sidebar:
+    st.header("Metadata")
+    uploaded = st.file_uploader("Upload metadata CSV (Snowflake columns export)", type=["csv"])
+    st.caption("Tip: This keeps your repo public without publishing table/column structure.")
+
+if not uploaded:
+    st.info("Upload your metadata CSV to begin.")
     st.stop()
 
-# Build table list
-meta["full_table"] = meta["db_name"].astype(str) + "." + meta["schema_name"].astype(str) + "." + meta["table_name"].astype(str)
+try:
+    raw = pd.read_csv(uploaded)
+    meta = standardize_metadata_columns(raw)
+except Exception as e:
+    st.error(f"Could not read/normalize your CSV.\n\nError: {e}")
+    st.stop()
+
+meta["full_table"] = meta["db_name"] + "." + meta["schema_name"] + "." + meta["table_name"]
 tables = sorted(meta["full_table"].unique().tolist())
 
-# ---------- UI Layout ----------
 left, right = st.columns([0.35, 0.65], gap="large")
 
 with left:
     st.subheader("1) Select table")
-    search = st.text_input("Search table", placeholder="Type to filter tables…")
+    search = st.text_input("Search table", placeholder="Type to filter…")
     filtered_tables = [t for t in tables if search.lower() in t.lower()] if search else tables
-
     selected_table = st.selectbox("Table", filtered_tables, index=0 if filtered_tables else None)
+
     row_limit = st.number_input("Row limit (safety)", min_value=1, max_value=5_000_000, value=DEFAULT_ROW_LIMIT, step=10000)
 
     if not selected_table:
         st.info("Select a table to continue.")
         st.stop()
 
-    db, schema, table = selected_table.split(".", 2)
     st.markdown(f"**Selected:** `{selected_table}`")
 
-# Table columns
 tcols = meta[meta["full_table"] == selected_table].sort_values("ordinal_position")
 tcols["data_family"] = tcols["data_type"].apply(normalize_dtype)
 
@@ -216,18 +225,13 @@ with right:
     st.subheader("2) Pick columns + filters")
 
     with st.expander("Columns in selected table", expanded=True):
-        st.dataframe(
-            tcols[["ordinal_position", "column_name", "data_type", "data_family"]],
-            use_container_width=True,
-            hide_index=True
-        )
+        show_cols = ["ordinal_position", "column_name", "data_type", "data_family"]
+        st.dataframe(tcols[show_cols], use_container_width=True, hide_index=True)
 
     st.markdown("---")
-
-    # Output column selection
     st.markdown("### Output columns")
     all_col_names = tcols["column_name"].tolist()
-    default_selected = all_col_names[: min(15, len(all_col_names))]  # small default
+    default_selected = all_col_names[: min(15, len(all_col_names))]
 
     out_cols = st.multiselect(
         "Choose columns to export (leave empty for *)",
@@ -244,7 +248,7 @@ with right:
 
     filters_payload = []
     if filter_cols:
-        st.caption("Fill every filter below. If you don’t want a filter, remove it from the selection.")
+        st.caption("Fill every filter below. Remove a filter column if you don’t want to provide a value.")
         for col in filter_cols:
             row = tcols[tcols["column_name"] == col].iloc[0]
             family = row["data_family"]
@@ -255,26 +259,14 @@ with right:
 
             with c1:
                 if family == "datetime":
-                    mode = st.selectbox(
-                        f"{col} filter type",
-                        options=["between", "before", "after", "on"],
-                        key=f"{col}_dt_mode"
-                    )
+                    mode = st.selectbox(f"{col} filter type", ["between", "before", "after", "on"], key=f"{col}_dt_mode")
                 elif family == "number":
-                    mode = st.selectbox(
-                        f"{col} operator",
-                        options=["=", "!=", "<", "<=", ">", ">=", "between"],
-                        key=f"{col}_num_op"
-                    )
+                    mode = st.selectbox(f"{col} operator", ["=", "!=", "<", "<=", ">", ">=", "between"], key=f"{col}_num_op")
                 elif family == "boolean":
                     mode = "equals"
                     st.markdown("Operator: `=`")
                 else:
-                    mode = st.selectbox(
-                        f"{col} operator",
-                        options=["equals", "contains", "in"],
-                        key=f"{col}_txt_op"
-                    )
+                    mode = st.selectbox(f"{col} operator", ["equals", "contains", "in"], key=f"{col}_txt_op")
 
             with c2:
                 payload = {"column_name": col, "data_family": family}
@@ -293,41 +285,27 @@ with right:
                 elif family == "number":
                     payload["operator"] = mode
                     if mode == "between":
-                        start = st.text_input(f"{col} min", key=f"{col}_num_min", placeholder="e.g. 10")
-                        end = st.text_input(f"{col} max", key=f"{col}_num_max", placeholder="e.g. 100")
-                        payload["start"] = start
-                        payload["end"] = end
+                        payload["start"] = st.text_input(f"{col} min", key=f"{col}_num_min", placeholder="e.g. 10")
+                        payload["end"] = st.text_input(f"{col} max", key=f"{col}_num_max", placeholder="e.g. 100")
                     else:
-                        val = st.text_input(f"{col} value", key=f"{col}_num_val", placeholder="e.g. 123")
-                        payload["value"] = val
+                        payload["value"] = st.text_input(f"{col} value", key=f"{col}_num_val", placeholder="e.g. 123")
 
                 elif family == "boolean":
-                    val = st.selectbox(f"{col} value", options=[True, False], key=f"{col}_bool_val")
-                    payload["value"] = val
+                    payload["value"] = st.selectbox(f"{col} value", [True, False], key=f"{col}_bool_val")
 
                 else:
                     payload["operator"] = mode
                     if mode == "in":
-                        vals = st.text_area(
-                            f"{col} values (one per line)",
-                            key=f"{col}_in_vals",
-                            placeholder="value1\nvalue2\nvalue3"
-                        )
+                        vals = st.text_area(f"{col} values (one per line)", key=f"{col}_in_vals", placeholder="value1\nvalue2\nvalue3")
                         payload["values_list"] = [v for v in vals.splitlines() if v.strip()]
                     else:
-                        val = st.text_input(f"{col} value", key=f"{col}_txt_val")
-                        payload["value"] = val
+                        payload["value"] = st.text_input(f"{col} value", key=f"{col}_txt_val")
 
             filters_payload.append(payload)
             st.markdown("---")
 
-    # Build query button
-    build = st.button("Generate SQL", type="primary")
-
-    if build:
+    if st.button("Generate SQL", type="primary"):
         where_sql, errors = build_where_clause(filters_payload)
-
-        # Enforce your rule: if a filter column is selected, it must have a value.
         if errors:
             st.error("Fix these before generating SQL:\n- " + "\n- ".join(errors))
             st.stop()
@@ -341,6 +319,5 @@ FROM {selected_table}
 {where_sql}
 LIMIT {int(row_limit)};
 """
-
         st.success("SQL generated. Copy/paste into Snowflake.")
         st.code(sql, language="sql")
