@@ -186,17 +186,38 @@ except Exception as e:
     st.error(f"Could not read/normalize your CSV.\n\nError: {e}")
     st.stop()
 
+# Full table key used for SQL
 meta["full_table"] = meta["db_name"] + "." + meta["schema_name"] + "." + meta["table_name"]
-tables = sorted(meta["full_table"].unique().tolist())
+
+# Display label = table name (with auto-disambiguation if duplicates exist)
+table_counts = meta.groupby("table_name")["full_table"].nunique().to_dict()
+
+def display_label(row):
+    # If table name is unique across all schemas, show just TABLE
+    # If not, show TABLE (SCHEMA) to avoid ambiguity
+    if table_counts.get(row["table_name"], 0) <= 1:
+        return row["table_name"]
+    return f'{row["table_name"]} ({row["schema_name"]})'
+
+table_map_df = (
+    meta[["db_name", "schema_name", "table_name", "full_table"]]
+    .drop_duplicates()
+    .copy()
+)
+table_map_df["display"] = table_map_df.apply(display_label, axis=1)
+
+# Sort labels nicely
+table_map_df = table_map_df.sort_values(["table_name", "schema_name", "db_name"])
+display_options = table_map_df["display"].tolist()
+display_to_full = dict(zip(table_map_df["display"], table_map_df["full_table"]))
 
 left, right = st.columns([0.35, 0.65], gap="large")
 
-# ---------- Table selection as a full list ----------
 with left:
     st.subheader("1) Select table")
 
-    # For 15 tables, radio is nicer than dropdown
-    selected_table = st.radio("Tables", options=tables, index=0)
+    selected_display = st.radio("Tables", options=display_options, index=0)
+    selected_table = display_to_full[selected_display]
 
     st.markdown("---")
     disable_limit = st.checkbox("Disable row LIMIT (get all matching rows)", value=False)
@@ -212,12 +233,12 @@ with left:
     else:
         st.warning("LIMIT is disabled. A date range filter will be required.")
 
-    st.markdown(f"**Selected:** `{selected_table}`")
+    # Show full table faintly (optional). If you want to hide fully, delete this line.
+    st.caption(f"Using: `{selected_table}`")
 
 tcols = meta[meta["full_table"] == selected_table].sort_values("ordinal_position").copy()
 tcols["data_family"] = tcols["data_type"].apply(normalize_dtype)
 
-# Identify datetime columns
 datetime_cols = tcols.loc[tcols["data_family"] == "datetime", "column_name"].tolist()
 default_date_col = datetime_cols[0] if datetime_cols else None
 
@@ -232,8 +253,6 @@ with right:
         )
 
     st.markdown("---")
-
-    # Output column selection
     st.markdown("### Output columns")
     all_col_names = tcols["column_name"].tolist()
     default_selected = all_col_names[: min(15, len(all_col_names))]
@@ -246,14 +265,14 @@ with right:
 
     st.markdown("### Filters")
 
-    # ---- Mandatory date filter logic when LIMIT disabled ----
+    # Mandatory date filter when limit disabled
     if disable_limit:
         if not default_date_col:
             st.error("LIMIT is disabled, but this table has no DATE/TIMESTAMP columns. Re-enable LIMIT or choose a different table.")
             st.stop()
 
         st.info(
-            f"Because LIMIT is disabled, a date range filter is required.\n\n"
+            f"Because LIMIT is disabled, a date filter is required.\n\n"
             f"Default date column selected: **{default_date_col}**. You can change it below."
         )
 
@@ -267,7 +286,6 @@ with right:
         if chosen_date_col == default_date_col:
             st.caption("Using the default first date-type column. Change it if you want a different date field.")
 
-        # Build mandatory date filter payload (always present)
         st.write(f"**Required date filter** · `{chosen_date_col}`")
         dt_mode = st.selectbox("Date filter type", ["between", "before", "after", "on"], key="req_dt_mode")
 
@@ -283,7 +301,6 @@ with right:
 
         st.markdown("---")
 
-    # Optional filters chosen by user (cannot remove the required date filter if disable_limit=True)
     filter_cols = st.multiselect(
         "Choose additional columns to filter on (each chosen filter must have a value)",
         options=all_col_names,
@@ -292,12 +309,9 @@ with right:
     )
 
     filters_payload = []
-
-    # Add required date filter first (if applicable)
     if disable_limit:
         filters_payload.append(required_date_payload)
 
-    # Render optional filters
     if filter_cols:
         st.caption("Fill every filter below. Remove a filter column if you don’t want to provide a value.")
         for col in filter_cols:
